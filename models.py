@@ -35,7 +35,18 @@ class ETLMetadata(Base):
 
     id = Column(Integer, primary_key=True)
 
-    pipeline_name = Column(String(100), unique=True)
+    pipeline_name = Column(String(100))
 
-    last_run = Column(DateTime(timezone=True))
+    run_start_time = Column(DateTime(timezone=True))
 
+    run_end_time = Column(DateTime(timezone=True))
+
+    status = Column(String(50))
+
+    records_extracted = Column(Integer)
+
+    records_loaded = Column(Integer)
+
+    watermark = Column(DateTime(timezone=True))
+
+    error_message = Column(String(1000), nullable=True)

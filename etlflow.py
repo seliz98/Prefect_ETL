@@ -11,6 +11,11 @@ from models import Articles,ETLMetadata
 from database import SessionLocal
 from datetime import datetime,timezone
 from prefect import flow,task,get_run_logger
+from audit import (
+    create_run,
+    get_latest_watermark,
+    update_run_success,
+    update_run_failure)
 
 # ---------------------------------------------------------------------------
 # Extract – fetch a single page of articles
@@ -60,69 +65,7 @@ def to_dataframe(raw_articles: list[list[dict[str, Any]]]) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Task – Read Last Run Timestamp
-# ---------------------------------------------------------------------------
-
-@task
-def get_last_run():
-
-    session = SessionLocal()
-    try:
-        metadata = (
-            session.query(ETLMetadata)
-            .filter(
-                ETLMetadata.pipeline_name == "devto_etl"
-            )
-            .first()
-        )
-
-        if metadata:
-            return metadata.last_run
-
-        return None
-    
-    finally:
-            session.close()
-
-
-@task
-def update_last_run(max_timestamp):
-
-    logger = get_run_logger()
-    session = SessionLocal()
-    try:
-        metadata = (
-            session.query(ETLMetadata)
-            .filter(
-                ETLMetadata.pipeline_name == "devto_etl"
-            )
-            .first()
-        )
-
-        if metadata:
-
-            metadata.last_run = max_timestamp
-
-        else:
-
-            metadata = ETLMetadata(
-                pipeline_name="devto_etl",
-                last_run=max_timestamp
-            )
-
-            session.add(metadata)
-
-        session.commit()
-        
-        logger.info(f"Watermark updated to {max_timestamp}")
-    
-    finally:
-
-            session.close()
-
-
-# ---------------------------------------------------------------------------
-# Load – save DataFrame to postgress db (or print preview)
+# Load – save DataFrame to postgress db
 # ---------------------------------------------------------------------------
 
 
@@ -173,50 +116,76 @@ def load_to_postgres(df):
 def etl(api_base: str, pages: int, per_page: int) -> None:
     """Run the end-to-end ETL for *pages* of articles."""
     logger = get_run_logger()
-    # Extract – simple loop for clarity
-    raw_pages: list[list[dict[str, Any]]] = []
-    for page_number in range(1, pages + 1):
-        raw_pages.append(fetch_page(page_number, api_base, per_page))
-    
-    # ---------------------
-    # Transform
-    # --------------------
-    df = to_dataframe(raw_pages)
-    
-    logger.info(
-        f"Fetched {len(df)} records from API"
-    )
+    run_id = create_run()
+    try:
 
-    # ---------------------
-    # Incremental Logic
-    # ---------------------
-
-    last_run = get_last_run()
-
-    if last_run:
-
-        logger.info(f"Filtering records newer than {last_run}")
-
-        df = df[df["published_at"] > last_run]
+        # Extract – simple loop for clarity
+        raw_pages: list[list[dict[str, Any]]] = []
+        for page_number in range(1, pages + 1):
+            raw_pages.append(fetch_page(page_number, api_base, per_page))
         
-        logger.info(f"Records remaining after filter: {len(df)}")
+        # ---------------------
+        # Transform
+        # --------------------
+        df = to_dataframe(raw_pages)
+        records_extracted = len(df)
+        logger.info(f"Fetched {records_extracted} records from API")
 
-
-    if not df.empty:
-
-        max_timestamp = df["published_at"].max()
-
-        load_to_postgres(df)
-
-        update_last_run(max_timestamp)
-
-        logger.info("ETL completed successfully")
-
-    else:
+        # ---------------------
+        # Incremental Logic
+        # ---------------------
 
         
-        logger.info("No new records found.")
-        return
+        watermark = (get_latest_watermark())
+
+
+        if watermark:
+
+            logger.info(f"Filtering records newer than {watermark}")
+
+            df = df[df["published_at"] > watermark]
+            
+            logger.info(f"Records remaining after filter: {len(df)}")
+
+
+        if not df.empty:
+
+            new_watermark = df["published_at"].max()
+
+            load_to_postgres(df)
+
+            
+            update_run_success(
+                        run_id=run_id,
+                        records_extracted=records_extracted,
+                        records_loaded=len(df),
+                        watermark=new_watermark
+                    )
+
+
+            logger.info("ETL completed successfully")
+
+        else:
+
+            
+            update_run_success(
+                            run_id=run_id,
+                            records_extracted=records_extracted,
+                            records_loaded=0,
+                            watermark=watermark
+                        )
+
+            logger.info("No new records found.")
+            return
+        
+    except Exception as e:
+
+            update_run_failure(
+                run_id,
+                str(e)
+            )
+
+            raise
 
 
 
